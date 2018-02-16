@@ -210,6 +210,14 @@ exec_app (int prog_arg, char **argv)
   exit (1);
 }
 
+static pid_t bus_pid;
+static pid_t app_pid;
+
+static void signal_handler(int signum) {
+  /* forward signal to app */
+  kill(app_pid, SIGTERM);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -221,8 +229,7 @@ main (int argc, char **argv)
   const char *prev_arg = NULL;
   int i = 1;
   int requires_arg = 0;
-  pid_t bus_pid;
-  pid_t app_pid;
+  int exit_status;
 
   while (i < argc)
     {
@@ -370,6 +377,10 @@ main (int argc, char **argv)
   if (bus_pid == 0)
     {
       /* child */
+
+      /* avoid getting shell triggered signals like SIGINT */
+      setpgrp();
+
       exec_dbus_daemon (dbus_daemon, bus_address_pipe, config_file);
       /* not reached */
       return 127;
@@ -420,12 +431,22 @@ main (int argc, char **argv)
   if (app_pid == 0)
     {
       /* child */
+
+      /* avoid getting shell triggered signals like SIGINT */
+      setpgrp();
+
       exec_app (prog_arg, argv);
       /* not reached */
       return 127;
     }
 
-  while (1)
+  signal(SIGINT, signal_handler);
+  signal(SIGQUIT, signal_handler);
+  signal(SIGTERM, signal_handler);
+
+  exit_status = 0;
+
+  while (bus_pid || app_pid)
     {
       int child_status;
       pid_t child_pid = waitpid (-1, &child_status, 0);
@@ -448,6 +469,11 @@ main (int argc, char **argv)
           /* no need to kill it, now */
           bus_pid = 0;
 
+          if (!app_pid) {
+              /* app gone, this is expected so get out of here */
+              continue;
+          }
+ 
           if (WIFEXITED (child_status))
             fprintf (stderr, "%s: dbus-daemon exited with code %d\n",
                 me, WEXITSTATUS (child_status));
@@ -459,19 +485,25 @@ main (int argc, char **argv)
         }
       else if (child_pid == app_pid)
         {
+          app_pid = 0;
+
           if (bus_pid != 0)
             kill (bus_pid, SIGTERM);
 
-          if (WIFEXITED (child_status))
-            return WEXITSTATUS (child_status);
+          if (WIFEXITED (child_status)) {
+            exit_status = WEXITSTATUS (child_status);
+            continue;
+          }
 
           /* if it died from a signal, behave like sh(1) */
-          if (WIFSIGNALED (child_status))
-            return 128 + WTERMSIG (child_status);
+          if (WIFSIGNALED (child_status)) {
+            exit_status = 128 + WTERMSIG (child_status);
+            continue;
+          }
 
           /* I give up (this should never be reached) */
           fprintf (stderr, "%s: child process died or something\n", me);
-          return 127;
+          exit_status = 127;
         }
       else
         {
@@ -479,6 +511,5 @@ main (int argc, char **argv)
               (long) child_pid);
         }
     }
-
-  return 0;
+  return exit_status;
 }
